@@ -12,6 +12,7 @@ import struct
 import json
 import string
 import argparse
+import re
 from pathlib import Path
 from NextionChecksum import Checksum
 from NextionInstructionSets import all_instruction_sets
@@ -219,6 +220,9 @@ class Usercode:
         self.blocks = dict()
         while nextBlock <= len(self.raw) - 4:
             currentBlock = nextBlock
+            blockSize = struct.unpack_from("<I", self.raw, currentBlock)[0]
+            if currentBlock + 4 + blockSize > len(self.raw):
+                break  # block size overflows available data
             raw, nextBlock = self._getRawBlock(currentBlock)
             self.blocks[currentBlock] = self.CodeBlock(self.instruction_set, raw)
         #self.pages = dict()
@@ -353,6 +357,29 @@ class HeaderData:
 
 class TFTFile:
 
+    _nextion_type_names = {
+        0x79: "page",           # page
+        0x74: "text",           # t
+        0x37: "scrolling_text", # g
+        0x36: "number",         # n
+        0x3B: "xfloat",         # x
+        0x62: "button",         # b
+        0x35: "dual_state",     # bt
+        0x01: "slider",         # h
+        0x6A: "progress_bar",   # j
+        0x71: "crop",           # q
+        0x70: "picture",        # p
+        0x00: "waveform",       # s
+        0x7A: "gauge",          # z
+        0x33: "timer",          # tm
+        0x34: "variable",       # va
+        0x38: "checkbox",       # c
+        0x39: "radio",          # r
+        0x6D: "hotspot",        # m
+        0x3A: "qrcode",         # qr
+        0x05: "touchcap",       # tc
+    }
+
     _modelXORs = {
          "NX3224T024_011": 0x6d713e32,
          "NX3224T028_011": 0x965cdd00,
@@ -471,18 +498,48 @@ class TFTFile:
         "hasCRC":  True,
         "content": {
             "static_usercode_address":      {"struct": "I", "val": 0},
-#            "unknown_app_vas_address":      {"struct": "I", "val": 0},
-#            "unknown_app_vas_count":        {"struct": "I", "val": 0},
             "app_attributes_data_address":  {"struct": "I", "val": 0},
             "ressources_files_address":     {"struct": "I", "val": 0},
             "usercode_address":             {"struct": "I", "val": 0},
             "unknown_pages_address":        {"struct": "I", "val": 0},
             "unknown_objects_address":      {"struct": "I", "val": 0},
             "pictures_address":             {"struct": "I", "val": 0},
-            "gmovs_address":                {"struct": "I", "val": 0},
-            "videos_address":               {"struct": "I", "val": 0},
-            "audios_address":               {"struct": "I", "val": 0},
-            "fonts_address":                {"struct": "I", "val": 0},
+            "gmovs_address":               {"struct": "I", "val": 0},
+            "videos_address":              {"struct": "I", "val": 0},
+            "audios_address":              {"struct": "I", "val": 0},
+            "fonts_address":               {"struct": "I", "val": 0},
+            "unknown_maincode_binary":      {"struct": "I", "val": 0},
+            "pages_count":                  {"struct": "H", "val": 0},
+            "unknown_objects_count":        {"struct": "H", "val": 0},
+            "pictures_count":               {"struct": "H", "val": 0},
+            "gmovs_count":                  {"struct": "H", "val": 0},
+            "videos_count":                 {"struct": "H", "val": 0},
+            "audios_count":                 {"struct": "H", "val": 0},
+            "fonts_count":                  {"struct": "H", "val": 0},
+            "unknown_res1":                 {"struct": "H", "val": 0},
+            "unknown_encode":               {"struct": "B", "val": 0},
+            "unknown_res2":                 {"struct": "B", "val": 0},
+            "unknown_res3":                 {"struct": "H", "val": 0},
+        },
+    }
+    _fileHeader2_ext = {
+        "size":    0xc8,
+        "start":   0xc8,
+        "hasCRC":  True,
+        "content": {
+            "static_usercode_address":      {"struct": "I", "val": 0},
+            "app_vas_address":              {"struct": "I", "val": 0},
+            "app_vas_count":                {"struct": "I", "val": 0},
+            "app_attributes_data_address":  {"struct": "I", "val": 0},
+            "ressources_files_address":     {"struct": "I", "val": 0},
+            "usercode_address":             {"struct": "I", "val": 0},
+            "unknown_pages_address":        {"struct": "I", "val": 0},
+            "unknown_objects_address":      {"struct": "I", "val": 0},
+            "pictures_address":             {"struct": "I", "val": 0},
+            "gmovs_address":               {"struct": "I", "val": 0},
+            "videos_address":              {"struct": "I", "val": 0},
+            "audios_address":              {"struct": "I", "val": 0},
+            "fonts_address":               {"struct": "I", "val": 0},
             "unknown_maincode_binary":      {"struct": "I", "val": 0},
             "pages_count":                  {"struct": "H", "val": 0},
             "unknown_objects_count":        {"struct": "H", "val": 0},
@@ -511,7 +568,14 @@ class TFTFile:
             decode_hint = self._modelXORs[self.model]
         if header2_hint:
             decode_hint = header2_hint
-        self.header2 = HeaderData(self.raw, self._fileHeader2, decode_hint)
+
+        # Select header2 layout based on editor version
+        h2_layout = self._fileHeader2
+        v_main = self.header1.content.get("editor_version_main", 0)
+        v_sub = self.header1.content.get("editor_version_sub", 0)
+        if v_main > 1 or (v_main == 1 and v_sub >= 67):
+            h2_layout = self._fileHeader2_ext
+        self.header2 = HeaderData(self.raw, h2_layout, decode_hint)
 
         # Determine correct instruction set based on editor and model series
         version_str = self.getEditorVersionStr()
@@ -567,7 +631,13 @@ class TFTFile:
             return b""
 
     def getRawUsercode(self):
-        return self.raw[self._getVal("usercode_address") : self._getVal("unknown_pages_address")]
+        start = self._getVal("usercode_address")
+        # static_usercode_address is the size of actual block data (tighter bound)
+        static_size = self._getVal("static_usercode_address")
+        pages_addr = self._getVal("unknown_pages_address")
+        if static_size and static_size < pages_addr - start:
+            return self.raw[start : start + static_size]
+        return self.raw[start : pages_addr]
 
     def exportRawBootloader(self, path = "/Raw/Bootloader.bin"):
         with open(path, "w") as f:
@@ -585,29 +655,250 @@ class TFTFile:
         with open(path, "w") as f:
             f.write(self.getRawUsercode())
 
-    def getReadable(self, includeUnknowns = False, includeBins = False):
+    def getReadable(self, includeUnknowns=False):
         d = pdict()
-        d["GeneralInfo"] = {"Target Model": self.model}
+
+        # Info section — rich metadata from both headers
+        uc_addr = self._getVal("usercode_address")
+        pages_addr = self._getVal("unknown_pages_address")
+        static_size = self._getVal("static_usercode_address")
+        uc_size = static_size if static_size and static_size < pages_addr - uc_addr else pages_addr - uc_addr
+        info = {
+            "model": self.model,
+            "editor": self.getEditorVersionStr(),
+            "resolution": [self._getVal("lcd_resolution_x"), self._getVal("lcd_resolution_y")],
+            "orientation": self._getVal("ui_orientation"),
+            "pages_count": self._getVal("pages_count"),
+            "objects_count": self._getVal("unknown_objects_count"),
+            "pictures_count": self._getVal("pictures_count"),
+            "fonts_count": self._getVal("fonts_count"),
+            "usercode_address": f"0x{uc_addr:x}",
+            "usercode_size": uc_size,
+        }
         if not self.header2.encrypted:
-            d["GeneralInfo"]["Header 2 XOR Key"] = "Unknown (used 0x00)"
-        d["Header1"]     = dict([(k, v) for k,v in self.header1.content.items() if includeUnknowns or (not k.startswith("unknown"))])
-        d["Header2"]     = dict([(k, hex(v)) for k,v in self.header2.content.items() if includeUnknowns or (not k.startswith("unknown"))])
-        d["Bootloader"]  = "[binary data]"
-        d["Pictures"]    = "[binary data]"
-        d["Fonts"]       = "[binary data]"
-        d["Usercode"]    = dict()
+            info["header2_key_unknown"] = True
+        d["info"] = info
 
-        if includeBins:
-            d["Bootloader"] = hexStr(self.getRawBootloader())
-            d["Pictures"]   = hexStr(self.getRawPictures())
-            d["Fonts"]      = hexStr(self.getRawFonts())
+        # Raw headers — all integer values for parseability
+        d["header1"] = dict([(k, v) for k, v in self.header1.content.items()
+                             if includeUnknowns or not k.startswith("unknown")])
+        d["header2"] = dict([(k, v) for k, v in self.header2.content.items()
+                             if includeUnknowns or not k.startswith("unknown")])
 
-        for addr,block in self.usercode.blocks.items():
-            if self.hexVals:
-                addr = hex(addr)
-            d["Usercode"][addr] = block.decoded
+        # Definitions (block 0) — extract meaningful strings
+        blocks = list(self.usercode.blocks.items())
+        if blocks:
+            _, block0 = blocks[0]
+            strings = self._extract_ascii_strings(block0.raw)
+            d["definitions"] = {
+                "size": len(block0.raw),
+                "strings": [{"offset": f"0x{off:03x}", "value": s} for off, s in strings],
+            }
+        else:
+            d["definitions"] = {"size": 0, "strings": []}
 
+        # Parse component metadata from page/object records
+        page_objects = self._parse_objects()
+
+        # Build block lookup: usercode offset → block object
+        block_map = {addr: blk for addr, blk in blocks}
+
+        # Find dict block indices for page boundaries
+        dict_indices = [i for i, (_, blk) in enumerate(blocks)
+                        if isinstance(blk.decoded, dict)]
+        pages_count = self._getVal("pages_count")
+
+        pages = []
+        if page_objects and dict_indices and len(dict_indices) == pages_count:
+            prev_start = 1  # after block 0
+            for page_num, dict_idx in enumerate(dict_indices):
+                # Collect all block offsets for this page (between prev page end and dict block)
+                page_block_offsets = [blocks[i][0] for i in range(prev_start, dict_idx)]
+
+                # Build event pointer → (obj_index, slot, event_name) mapping
+                # and sorted list of event boundaries
+                obj_list = page_objects[page_num]
+                event_starts = {}  # offset → (obj_index, event_name)
+                for obj_i, obj in enumerate(obj_list):
+                    ptrs = obj.get("_event_ptrs", ())
+                    for slot, ptr in enumerate(ptrs):
+                        if ptr != 0xFFFFFFFF:
+                            ename = self._event_name(obj["type"], slot)
+                            event_starts[ptr] = (obj_i, ename)
+
+                sorted_events = sorted(event_starts.keys())
+
+                # Assign each block to an event based on offset ranges
+                # Blocks between event_starts[i] and event_starts[i+1] belong to event i
+                # Blocks before the first event are "preinitialize"
+                obj_events = {}  # obj_index → {event_name: [blocks]}
+                preinit_blocks = []
+
+                for blk_off in page_block_offsets:
+                    blk = block_map.get(blk_off)
+                    if not blk:
+                        continue
+                    text = self._block_text(blk)
+                    if not text:
+                        continue
+                    block_entry = {
+                        "offset": f"0x{blk_off:x}",
+                        "size": len(blk.raw),
+                        "content": text,
+                    }
+
+                    # Find which event this block belongs to
+                    # (last event start <= blk_off)
+                    owner = None
+                    for i in range(len(sorted_events) - 1, -1, -1):
+                        if blk_off >= sorted_events[i]:
+                            owner = event_starts[sorted_events[i]]
+                            break
+
+                    if owner is None:
+                        preinit_blocks.append(block_entry)
+                    else:
+                        obj_i, ename = owner
+                        if obj_i not in obj_events:
+                            obj_events[obj_i] = {}
+                        if ename not in obj_events[obj_i]:
+                            obj_events[obj_i][ename] = []
+                        obj_events[obj_i][ename].append(block_entry)
+
+                # Build clean object list (strip internal _event_ptrs, add events)
+                clean_objects = []
+                for obj_i, obj in enumerate(obj_list):
+                    clean_obj = {
+                        "id": obj["id"], "type": obj["type"],
+                        "x": obj["x"], "y": obj["y"],
+                        "w": obj["w"], "h": obj["h"],
+                    }
+                    if obj_i in obj_events:
+                        clean_obj["events"] = obj_events[obj_i]
+                    clean_objects.append(clean_obj)
+
+                _, dict_blk = blocks[dict_idx]
+                variables = dict_blk.decoded if isinstance(dict_blk.decoded, dict) else {}
+                variables = {str(k): v for k, v in variables.items()}
+
+                page_entry = {"page": page_num}
+                if preinit_blocks:
+                    page_entry["preinitialize"] = preinit_blocks
+                page_entry["objects"] = clean_objects
+                page_entry["variables"] = variables
+                pages.append(page_entry)
+                prev_start = dict_idx + 1
+        else:
+            # Fallback: no object metadata, flat block list
+            for i, (addr, blk) in enumerate(blocks[1:], 1):
+                text = self._block_text(blk)
+                if not text:
+                    continue
+                entry = {
+                    "page": None,
+                    "blocks": [{
+                        "offset": f"0x{addr:x}",
+                        "size": len(blk.raw),
+                        "content": text,
+                    }],
+                }
+                if isinstance(blk.decoded, dict):
+                    entry["variables"] = {str(k): v for k, v in blk.decoded.items()}
+                pages.append(entry)
+
+        d["pages"] = pages
         return str(d)
+
+    @staticmethod
+    def _block_text(blk):
+        """Get block content as a string, handling dict decoded values."""
+        if not blk.raw:
+            return ""
+        if not blk.decoded:
+            return ""
+        if blk.decoded == "EMPTY_BLOCK":
+            return ""
+        if isinstance(blk.decoded, dict):
+            return json.dumps(blk.decoded, indent=2)
+        return str(blk.decoded) if isinstance(blk.decoded, str) else repr(blk.decoded)
+
+    @staticmethod
+    def _extract_ascii_strings(data, min_len=4):
+        """Extract printable ASCII strings from binary data."""
+        results = []
+        current = []
+        start = -1
+        for i, b in enumerate(data):
+            if 0x20 <= b < 0x7f:
+                if not current:
+                    start = i
+                current.append(chr(b))
+            else:
+                if len(current) >= min_len:
+                    results.append((start, "".join(current)))
+                current = []
+        if len(current) >= min_len:
+            results.append((start, "".join(current)))
+        return results
+
+    # Event slot names per component type.
+    # Slots not listed here use "event_N" as fallback.
+    _event_names = {
+        "page":  {0: "postinitialize"},
+        "timer": {4: "timer"},
+    }
+    _default_event_names = {
+        0: "event_0", 1: "event_1",
+        2: "touch_press", 3: "touch_release",
+        4: "event_4", 5: "event_5",
+    }
+
+    def _parse_objects(self):
+        """Parse page and object metadata records from the TFT binary.
+        Returns list of pages, each containing its object list with event
+        pointers, or None on failure."""
+        pages_addr = self._getVal("unknown_pages_address")
+        obj_addr = self._getVal("unknown_objects_address")
+        pages_count = self._getVal("pages_count")
+        obj_count = self._getVal("unknown_objects_count")
+
+        if pages_addr == 0 or obj_addr == 0 or pages_count == 0:
+            return None
+        page_sec_size = obj_addr - pages_addr
+        if page_sec_size != pages_count * 16:
+            return None
+        obj_sec_size = len(self.raw) - 4 - obj_addr  # -4 for file checksum
+        if obj_sec_size < obj_count * 232:
+            return None
+
+        result = []
+        obj_idx = 0
+        for pg in range(pages_count):
+            prec = self.raw[pages_addr + pg * 16 : pages_addr + (pg + 1) * 16]
+            _first_id, obj_cnt = struct.unpack_from("<HH", prec, 0)
+
+            objects = []
+            for j in range(obj_cnt):
+                off = obj_addr + obj_idx * 232
+                type_code = self.raw[off]
+                obj_id = self.raw[off + 1] | (self.raw[off + 2] << 8)
+                event_ptrs = struct.unpack_from("<6I", self.raw, off + 4)
+                x, y, w, h = struct.unpack_from("<HHHH", self.raw, off + 40)
+                type_name = self._nextion_type_names.get(type_code, f"unknown_0x{type_code:02x}")
+                objects.append({
+                    "id": obj_id, "type": type_name,
+                    "x": x, "y": y, "w": w, "h": h,
+                    "_event_ptrs": event_ptrs,
+                })
+                obj_idx += 1
+
+            result.append(objects)
+        return result
+
+    def _event_name(self, type_name, slot):
+        """Get human-readable event name for a component type and slot index."""
+        names = self._event_names.get(type_name, self._default_event_names)
+        return names.get(slot, f"event_{slot}")
 
     def _getVal(self, key:str):
         if key in self.header1.content:
@@ -724,15 +1015,17 @@ if __name__ == '__main__':
         result = tft.getReadable(includeUnknowns=True)
         if args.v:
             print(result)
-        if outputPath:
-            if outputPath.is_dir():
-                outputPath /= tftPath.with_suffix(".txt").name
-            outputPath.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                with open(outputPath, "w") as f:
-                    f.write(result)
-            except:
-                parser.error("Can't open output file!")
+        if not outputPath:
+            outputPath = tftPath.with_suffix(".json")
+        if outputPath.is_dir():
+            outputPath /= tftPath.with_suffix(".json").name
+        outputPath.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(outputPath, "w", encoding="utf-8") as f:
+                f.write(result)
+            print(f"Output written to: {outputPath}")
+        except Exception as e:
+            parser.error(f"Can't open output file: {e}")
     elif args.target == "LIST":
         def s(model):
             # Returns an ascending number to sort models by series, resolution, then size
@@ -776,4 +1069,3 @@ if __name__ == '__main__':
             outputPath = outputPath.with_suffix(".tft")
         with open(outputPath, "wb") as f:
             f.write(tft.raw)
-
